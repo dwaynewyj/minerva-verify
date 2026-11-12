@@ -699,16 +699,34 @@ if (listedPaths === null) {
     if (c.key_id && keyId !== c.key_id) { fail("checkpoint " + file + ": key id " + c.key_id + " does not match the public key it carries (" + keyId + ")"); continue; }
     if (cpKeyId && keyId !== cpKeyId) { fail("checkpoint " + file + ": signed under key " + keyId + ", not the deployment key in checkpoints/key.pem (" + cpKeyId + ")"); continue; }
     if (keyId) deploymentKeys.push({ where: "checkpoint " + file, id: keyId });
-    good += 1;
-    console.log("checkpoint " + file + ": signature verifies, head seq " + row.seq + " (" + c.day + ", key " + keyId + ")");
     // the public log's copy (2026-10-26): the entry is fetched by the READER, never by this script — print the command and what to compare
     const entry = c.delivered && c.delivered.log_entry;
-    if (entry && typeof entry === "object" && typeof entry.uuid === "string") {
+    const hasEntry = entry && typeof entry === "object" && typeof entry.uuid === "string";
+    const messageSha = sha256(message);
+    // since 2026-11-12 the log holds a DSSE envelope of the signed bytes, signed by the same key: its signature is checked here, offline
+    if (hasEntry && entry.kind === "dsse") {
+      const type = String(entry.payload_type || "");
+      const pae = Buffer.concat([Buffer.from("DSSEv1 " + Buffer.byteLength(type, "utf8") + " " + type + " " + message.length + " ", "utf8"), message]);
+      let okEnv = false;
+      try { okEnv = verifySignature(null, pae, c.public_key_pem, Buffer.from(String(entry.dsse_signature || ""), "base64")); } catch (e) { okEnv = false; }
+      if (!okEnv) { fail("checkpoint " + file + ": the public log's envelope signature does not verify over the checkpoint's bytes under the key it carries"); continue; }
+      if (entry.payload_sha256 !== messageSha) { fail("checkpoint " + file + ": the public log's entry names payload " + String(entry.payload_sha256).slice(0, 12) + "…, not the SHA-256 of the checkpoint's bytes (" + messageSha.slice(0, 12) + "…)"); continue; }
+    }
+    good += 1;
+    console.log("checkpoint " + file + ": signature verifies, head seq " + row.seq + " (" + c.day + ", key " + keyId + ")");
+    if (hasEntry) {
       const base = typeof entry.url === "string" ? entry.url.replace(/\/api\/v1\/log\/entries\/?$/, "") : "https://rekor.sigstore.dev";
-      const messageSha = sha256(message);
-      console.log("checkpoint " + file + ": a copy reached the public log (entry " + (entry.logIndex !== undefined && entry.logIndex !== null ? entry.logIndex : entry.uuid) + "). Fetch it yourself — this script makes no network call:");
-      console.log("    curl -s " + base + "/api/v1/log/entries/" + entry.uuid);
-      console.log("    then base64-decode the entry's \"body\": its spec.data.hash.value must be " + messageSha + " (SHA-256 of the signed bytes), its spec.signature.content must be the file's signature (" + String(c.signature).slice(0, 16) + "…), and its spec.signature.publicKey.content base64-decodes to the key in checkpoints/key.pem; the entry's integratedTime is the log's own clock" + (entry.integratedTime ? " (" + new Date(Number(entry.integratedTime) * 1000).toISOString() + " when the post landed)" : "") + ".");
+      const named = entry.logIndex !== undefined && entry.logIndex !== null ? entry.logIndex : entry.uuid;
+      const landed = entry.integratedTime ? " (" + new Date(Number(entry.integratedTime) * 1000).toISOString() + " when the post landed — the log witnesses the head from then, which for an entry posted after its day is later than the day)" : "";
+      if (entry.kind === "dsse") {
+        console.log("checkpoint " + file + ": a copy reached the public log (entry " + named + ") as a DSSE envelope of the signed bytes (" + entry.payload_type + "); the envelope's signature verifies under the same key. Fetch the entry yourself — this script makes no network call:");
+        console.log("    curl -s " + base + "/api/v1/log/entries/" + entry.uuid);
+        console.log("    then base64-decode the entry's \"body\": its kind is dsse, its spec.payloadHash.value must be " + messageSha + " (SHA-256 of the signed bytes), its spec.signatures[0].signature must be the envelope signature (" + String(entry.dsse_signature).slice(0, 16) + "…, checked above), and its spec.signatures[0].verifier base64-decodes to the key in checkpoints/key.pem; the entry's integratedTime is the log's own clock" + landed + ".");
+      } else {
+        console.log("checkpoint " + file + ": a copy reached the public log (entry " + named + "). Fetch it yourself — this script makes no network call:");
+        console.log("    curl -s " + base + "/api/v1/log/entries/" + entry.uuid);
+        console.log("    then base64-decode the entry's \"body\": its spec.data.hash.value must be " + messageSha + " (SHA-256 of the signed bytes), its spec.signature.content must be the file's signature (" + String(c.signature).slice(0, 16) + "…), and its spec.signature.publicKey.content base64-decodes to the key in checkpoints/key.pem; the entry's integratedTime is the log's own clock" + landed + ".");
+      }
     }
   }
   if (good === files.length) console.log("ok: " + good + " checkpoint" + (good === 1 ? " names" : "s name") + " a ledger row and verif" + (good === 1 ? "ies" : "y") + " under the key in checkpoints/key.pem");
